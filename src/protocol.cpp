@@ -11,7 +11,6 @@ uint32_t crc32(const void* data, std::size_t length) {
 
     for (std::size_t i = 0; i < length; ++i) {
         crc ^= bytes[i];
-
         for (int bit = 0; bit < 8; ++bit) {
             if (crc & 1U) {
                 crc = (crc >> 1U) ^ 0xEDB88320U;
@@ -20,7 +19,6 @@ uint32_t crc32(const void* data, std::size_t length) {
             }
         }
     }
-
     return crc ^ 0xFFFFFFFFu;
 }
 
@@ -57,8 +55,7 @@ bool parse_frame(const uint8_t* frame,
     }
 
     const auto type = static_cast<MessageType>(header->message_type);
-    if (static_cast<uint8_t>(type) < 1 ||
-        static_cast<uint8_t>(type) > 9) {
+    if (static_cast<uint8_t>(type) < 1 || static_cast<uint8_t>(type) > 9) {
         return false;
     }
 
@@ -82,7 +79,6 @@ bool parse_frame(const uint8_t* frame,
     IndustrialHeader header_copy = *header;
     const uint32_t received_crc = ntohl(header_copy.header_crc32);
     header_copy.header_crc32 = 0;
-
     const uint32_t calc_crc = crc32(&header_copy, sizeof(header_copy));
     if (received_crc != calc_crc) {
         return false;
@@ -90,6 +86,10 @@ bool parse_frame(const uint8_t* frame,
 
     output.channel_id = channel_id;
     output.payload_length = payload_length;
+    output.command_id = ntohl(header->command_id);
+    output.stream_sequence = be64toh(header->stream_sequence);
+    output.timestamp_ns = be64toh(header->timestamp_ns);
+    output.flags = header->flags;
     output.message_type = type;
     output.payload = frame + eth_header_len + sizeof(IndustrialHeader);
 

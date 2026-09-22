@@ -1,4 +1,5 @@
 #include "industrial_rx.hpp"
+#include "channel_state_machine.hpp"
 #include "dpdk_helpers.hpp"
 #include "protocol.hpp"
 
@@ -8,6 +9,7 @@
 #include <rte_mempool.h>
 #include <rte_ring.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -24,18 +26,10 @@ namespace {
 std::string ring_name_for_channel(uint16_t channel_id, QueueType qtype) {
     const char* suffix = "lvds";
     switch (qtype) {
-        case QueueType::Lvds:
-            suffix = "lvds";
-            break;
-        case QueueType::ControlResult:
-            suffix = "result";
-            break;
-        case QueueType::ControlTx:
-            suffix = "tx";
-            break;
-        default:
-            suffix = "lvds";
-            break;
+        case QueueType::Lvds: suffix = "lvds"; break;
+        case QueueType::ControlResult: suffix = "result"; break;
+        case QueueType::ControlTx: suffix = "tx"; break;
+        default: suffix = "lvds"; break;
     }
     return "channel_" + std::to_string(channel_id) + "_" + suffix;
 }
@@ -45,10 +39,7 @@ std::string ring_name_for_channel(uint16_t channel_id, QueueType qtype) {
 class PrimaryReceiver::Impl {
 public:
     Impl() = default;
-
-    ~Impl() {
-        stop();
-    }
+    ~Impl() { stop(); }
 
     bool initialize(const ReceiverConfig& cfg) {
         config_ = cfg;
@@ -71,6 +62,8 @@ public:
         }
 
         for (uint16_t ch = 0; ch < kChannelCount; ++ch) {
+            channel_states_[ch].initialize(ch);
+
             const std::string lvds_name = ring_name_for_channel(ch, QueueType::Lvds);
             const std::string result_name = ring_name_for_channel(ch, QueueType::ControlResult);
             const std::string tx_name = ring_name_for_channel(ch, QueueType::ControlTx);
@@ -80,13 +73,11 @@ public:
                 config_.ring_size,
                 SOCKET_ID_ANY,
                 RING_F_EXACT_SZ);
-
             channels_[ch].control_result_rx = rte_ring_create(
                 result_name.c_str(),
                 config_.ring_size,
                 SOCKET_ID_ANY,
                 RING_F_EXACT_SZ);
-
             channels_[ch].control_tx = rte_ring_create(
                 tx_name.c_str(),
                 config_.ring_size,
@@ -101,22 +92,11 @@ public:
             }
         }
 
-        if (!configure_port(0,
-                            config_.port_cfg.rx_queues,
-                            config_.port_cfg.tx_queues,
-                            2048,
-                            2048,
-                            mbuf_pool_)) {
+        if (!configure_port(0, config_.port_cfg.rx_queues, config_.port_cfg.tx_queues, 2048, 2048, mbuf_pool_)) {
             std::cerr << "configure_port 0 failed\n";
             return false;
         }
-
-        if (!configure_port(1,
-                            config_.port_cfg.rx_queues,
-                            config_.port_cfg.tx_queues,
-                            2048,
-                            2048,
-                            mbuf_pool_)) {
+        if (!configure_port(1, config_.port_cfg.rx_queues, config_.port_cfg.tx_queues, 2048, 2048, mbuf_pool_)) {
             std::cerr << "configure_port 1 failed\n";
             return false;
         }
@@ -126,10 +106,7 @@ public:
     }
 
     bool start() {
-        if (running_.load()) {
-            return true;
-        }
-
+        if (running_.load()) return true;
         running_.store(true);
         rx_thread_ = std::thread(&PrimaryReceiver::Impl::rx_loop, this);
         tx_thread_ = std::thread(&PrimaryReceiver::Impl::tx_loop, this);
@@ -138,26 +115,17 @@ public:
 
     void stop() {
         running_.store(false);
-
-        if (rx_thread_.joinable()) {
-            rx_thread_.join();
-        }
-        if (tx_thread_.joinable()) {
-            tx_thread_.join();
-        }
+        if (rx_thread_.joinable()) rx_thread_.join();
+        if (tx_thread_.joinable()) tx_thread_.join();
     }
 
-    bool is_running() const noexcept {
-        return running_.load();
-    }
+    bool is_running() const noexcept { return running_.load(); }
 
     RuntimeStatsSnapshot get_runtime_stats() const {
         RuntimeStatsSnapshot snapshot{};
-
         for (std::size_t i = 0; i < kChannelCount; ++i) {
             const auto& src = stats_.channels[i];
             auto& dst = snapshot.channels[i];
-
             dst.lvds_frames = src.lvds_frames.load(std::memory_order_relaxed);
             dst.lvds_bytes = src.lvds_bytes.load(std::memory_order_relaxed);
             dst.control_result_frames = src.control_result_frames.load(std::memory_order_relaxed);
@@ -168,24 +136,19 @@ public:
             dst.queue_depth = src.queue_depth.load(std::memory_order_relaxed);
             dst.last_sequence = src.last_sequence.load(std::memory_order_relaxed);
         }
-
         snapshot.total_rx_frames = stats_.total_rx_frames.load(std::memory_order_relaxed);
         snapshot.total_rx_bytes = stats_.total_rx_bytes.load(std::memory_order_relaxed);
         snapshot.total_dropped = stats_.total_dropped.load(std::memory_order_relaxed);
         snapshot.total_crc_errors = stats_.total_crc_errors.load(std::memory_order_relaxed);
         snapshot.wal_write_failures = stats_.wal_write_failures.load(std::memory_order_relaxed);
-
         return snapshot;
     }
 
     ChannelStatsSnapshot get_channel_stats(uint16_t channel_id) const {
         ChannelStatsSnapshot snapshot{};
-        if (channel_id >= kChannelCount) {
-            return snapshot;
-        }
+        if (channel_id >= kChannelCount) return snapshot;
 
         const auto& src = stats_.channels[channel_id];
-
         snapshot.lvds_frames = src.lvds_frames.load(std::memory_order_relaxed);
         snapshot.lvds_bytes = src.lvds_bytes.load(std::memory_order_relaxed);
         snapshot.control_result_frames = src.control_result_frames.load(std::memory_order_relaxed);
@@ -195,7 +158,6 @@ public:
         snapshot.crc_errors = src.crc_errors.load(std::memory_order_relaxed);
         snapshot.queue_depth = src.queue_depth.load(std::memory_order_relaxed);
         snapshot.last_sequence = src.last_sequence.load(std::memory_order_relaxed);
-
         return snapshot;
     }
 
@@ -203,22 +165,17 @@ public:
                               uint32_t command_id,
                               const void* payload,
                               std::size_t payload_len) {
-        if (channel_id >= kChannelCount ||
-            payload == nullptr ||
-            payload_len == 0) {
+        if (channel_id >= kChannelCount || payload == nullptr || payload_len == 0) {
             return false;
         }
+
+        channel_states_[channel_id].enqueue_control_command(command_id, 0, payload, static_cast<uint16_t>(payload_len));
 
         auto* ring = channels_[channel_id].control_tx;
-        if (!ring) {
-            return false;
-        }
+        if (!ring) return false;
 
         auto* mbuf = rte_pktmbuf_alloc(mbuf_pool_);
-        if (!mbuf) {
-            return false;
-        }
-
+        if (!mbuf) return false;
         if (payload_len > rte_pktmbuf_tailroom(mbuf)) {
             rte_pktmbuf_free(mbuf);
             return false;
@@ -229,7 +186,6 @@ public:
             rte_pktmbuf_free(mbuf);
             return false;
         }
-
         std::memcpy(dst, payload, payload_len);
 
         if (rte_ring_enqueue(ring, mbuf) != 0) {
@@ -237,7 +193,6 @@ public:
             return false;
         }
 
-        (void)command_id;
         return true;
     }
 
@@ -250,11 +205,7 @@ private:
             for (uint16_t port = 0; port < 2; ++port) {
                 for (uint16_t q = 0; q < config_.port_cfg.rx_queues; ++q) {
                     const uint16_t nb = rte_eth_rx_burst(
-                        port,
-                        q,
-                        packets.data(),
-                        static_cast<uint16_t>(packets.size()));
-
+                        port, q, packets.data(), static_cast<uint16_t>(packets.size()));
                     for (uint16_t i = 0; i < nb; ++i) {
                         auto* mbuf = packets[i];
                         if (!handle_rx_packet(port, q, mbuf)) {
@@ -263,7 +214,6 @@ private:
                     }
                 }
             }
-
             std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
     }
@@ -275,20 +225,11 @@ private:
         while (running_.load()) {
             for (uint16_t ch = 0; ch < kChannelCount; ++ch) {
                 auto* ring = channels_[ch].control_tx;
-                if (!ring) {
-                    continue;
-                }
+                if (!ring) continue;
 
                 void* items[64];
-                const unsigned n = rte_ring_dequeue_burst(
-                    ring,
-                    items,
-                    64,
-                    nullptr);
-
-                if (n == 0) {
-                    continue;
-                }
+                const unsigned n = rte_ring_dequeue_burst(ring, items, 64, nullptr);
+                if (n == 0) continue;
 
                 for (unsigned i = 0; i < n; ++i) {
                     packets[i] = static_cast<rte_mbuf*>(items[i]);
@@ -296,22 +237,13 @@ private:
 
                 const uint16_t port = (ch < 6) ? 0 : 1;
                 const uint16_t queue = (ch < 6) ? ch : (ch - 6);
-
-                const uint16_t sent = rte_eth_tx_burst(
-                    port,
-                    queue,
-                    packets.data(),
-                    static_cast<uint16_t>(n));
-
+                const uint16_t sent = rte_eth_tx_burst(port, queue, packets.data(), static_cast<uint16_t>(n));
                 for (uint16_t i = sent; i < n; ++i) {
                     rte_pktmbuf_free(packets[i]);
                 }
 
-                stats_.channels[ch].control_tx_frames.fetch_add(
-                    n,
-                    std::memory_order_relaxed);
+                stats_.channels[ch].control_tx_frames.fetch_add(n, std::memory_order_relaxed);
             }
-
             std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
     }
@@ -331,9 +263,7 @@ private:
 
         const uint16_t expected_channel = port * kChannelsPerPort + queue;
         if (parsed.channel_id != expected_channel) {
-            stats_.channels[parsed.channel_id].dropped_frames.fetch_add(
-                1,
-                std::memory_order_relaxed);
+            stats_.channels[parsed.channel_id].dropped_frames.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -342,6 +272,11 @@ private:
 
         stats_.total_rx_frames.fetch_add(1, std::memory_order_relaxed);
         stats_.total_rx_bytes.fetch_add(total_len, std::memory_order_relaxed);
+
+        channel_states_[ch].on_lvds_frame(parsed.stream_sequence, parsed.timestamp_ns, parsed.payload_length);
+        if (channel_states_[ch].should_pause_for_high_water()) {
+            // high-water pause; device control path can trigger flow-control here
+        }
 
         if (config_.enable_wal) {
             if (!write_wal_record(config_.wal_dir, ch, raw, total_len)) {
@@ -353,18 +288,16 @@ private:
             case MessageType::LvdsData: {
                 auto* ring = channels_[ch].lvds_rx;
                 if (!ring) return false;
-
                 if (rte_ring_enqueue(ring, mbuf) != 0) {
                     stats_.total_dropped.fetch_add(1, std::memory_order_relaxed);
                     stats_.channels[ch].dropped_frames.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
-
                 stats_.channels[ch].lvds_frames.fetch_add(1, std::memory_order_relaxed);
                 stats_.channels[ch].lvds_bytes.fetch_add(parsed.payload_length, std::memory_order_relaxed);
+                stats_.channels[ch].last_sequence.store(parsed.stream_sequence, std::memory_order_relaxed);
                 break;
             }
-
             case MessageType::ControlResult:
             case MessageType::StatusReport:
             case MessageType::Ack:
@@ -372,17 +305,15 @@ private:
             case MessageType::ErrorReport: {
                 auto* ring = channels_[ch].control_result_rx;
                 if (!ring) return false;
-
                 if (rte_ring_enqueue(ring, mbuf) != 0) {
                     stats_.total_dropped.fetch_add(1, std::memory_order_relaxed);
                     stats_.channels[ch].dropped_frames.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
-
                 stats_.channels[ch].control_result_frames.fetch_add(1, std::memory_order_relaxed);
+                channel_states_[ch].on_control_result(parsed.command_id, parsed.stream_sequence, (type == MessageType::Ack) ? 0U : 1U);
                 break;
             }
-
             case MessageType::ControlCommand:
             case MessageType::FlowControl:
             case MessageType::Heartbeat: {
@@ -391,7 +322,6 @@ private:
                 rte_pktmbuf_free(mbuf);
                 return false;
             }
-
             default:
                 rte_pktmbuf_free(mbuf);
                 return false;
@@ -403,51 +333,26 @@ private:
 private:
     ReceiverConfig config_{};
     std::array<ChannelRings, kChannelCount> channels_{};
+    std::array<ChannelStateMachine, kChannelCount> channel_states_{};
     RuntimeStats stats_{};
-
     rte_mempool* mbuf_pool_ = nullptr;
     std::thread rx_thread_;
     std::thread tx_thread_;
     std::atomic_bool running_{false};
 };
 
-PrimaryReceiver::PrimaryReceiver()
-    : impl_(std::make_unique<PrimaryReceiver::Impl>()) {}
-
+PrimaryReceiver::PrimaryReceiver() : impl_(std::make_unique<PrimaryReceiver::Impl>()) {}
 PrimaryReceiver::~PrimaryReceiver() = default;
-
 PrimaryReceiver::PrimaryReceiver(PrimaryReceiver&&) noexcept = default;
 PrimaryReceiver& PrimaryReceiver::operator=(PrimaryReceiver&&) noexcept = default;
 
-bool PrimaryReceiver::initialize(const ReceiverConfig& config) {
-    return impl_->initialize(config);
-}
-
-bool PrimaryReceiver::start() {
-    return impl_->start();
-}
-
-void PrimaryReceiver::stop() {
-    impl_->stop();
-}
-
-bool PrimaryReceiver::is_running() const noexcept {
-    return impl_->is_running();
-}
-
-RuntimeStatsSnapshot PrimaryReceiver::get_runtime_stats() const {
-    return impl_->get_runtime_stats();
-}
-
-ChannelStatsSnapshot PrimaryReceiver::get_channel_stats(uint16_t channel_id) const {
-    return impl_->get_channel_stats(channel_id);
-}
-
-bool PrimaryReceiver::send_control_command(
-    uint16_t channel_id,
-    uint32_t command_id,
-    const void* payload,
-    std::size_t payload_len) {
+bool PrimaryReceiver::initialize(const ReceiverConfig& config) { return impl_->initialize(config); }
+bool PrimaryReceiver::start() { return impl_->start(); }
+void PrimaryReceiver::stop() { impl_->stop(); }
+bool PrimaryReceiver::is_running() const noexcept { return impl_->is_running(); }
+RuntimeStatsSnapshot PrimaryReceiver::get_runtime_stats() const { return impl_->get_runtime_stats(); }
+ChannelStatsSnapshot PrimaryReceiver::get_channel_stats(uint16_t channel_id) const { return impl_->get_channel_stats(channel_id); }
+bool PrimaryReceiver::send_control_command(uint16_t channel_id, uint32_t command_id, const void* payload, std::size_t payload_len) {
     return impl_->send_control_command(channel_id, command_id, payload, payload_len);
 }
 

@@ -49,6 +49,10 @@ static_assert(sizeof(IndustrialHeader) == 40,
 struct ParsedFrame {
     uint16_t channel_id = 0;
     uint32_t payload_length = 0;
+    uint32_t command_id = 0;
+    uint64_t stream_sequence = 0;
+    uint64_t timestamp_ns = 0;
+    uint8_t flags = 0;
     MessageType message_type = MessageType::LvdsData;
     const uint8_t* payload = nullptr;
 };

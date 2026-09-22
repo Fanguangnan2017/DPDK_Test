@@ -1,4 +1,5 @@
 #include "worker.hpp"
+#include "channel_state_machine.hpp"
 
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
@@ -15,44 +16,28 @@
 namespace industrial {
 
 namespace {
-
 constexpr const char* kMbufPoolName = "industrial_rx_mbuf_pool";
 
-bool dequeue_packet(
-    rte_ring* ring,
-    std::vector<uint8_t>& output,
-    std::chrono::milliseconds timeout) {
-    if (ring == nullptr) {
-        return false;
-    }
-
+bool dequeue_packet(rte_ring* ring, std::vector<uint8_t>& output, std::chrono::milliseconds timeout) {
+    if (ring == nullptr) return false;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-
     while (std::chrono::steady_clock::now() < deadline) {
         void* item = nullptr;
-
         if (rte_ring_dequeue(ring, &item) == 0) {
             auto* mbuf = static_cast<rte_mbuf*>(item);
-            if (mbuf == nullptr) {
-                continue;
-            }
-
+            if (mbuf == nullptr) continue;
             const uint32_t packet_len = rte_pktmbuf_pkt_len(mbuf);
             const uint8_t* data = rte_pktmbuf_mtod(mbuf, const uint8_t*);
-
             if (data == nullptr || packet_len == 0) {
                 rte_pktmbuf_free(mbuf);
                 return false;
             }
-
             output.assign(data, data + packet_len);
             rte_pktmbuf_free(mbuf);
             return true;
         }
-
         std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-
     return false;
 }
 
@@ -65,6 +50,7 @@ public:
     rte_ring* control_result_ring = nullptr;
     rte_ring* control_tx_ring = nullptr;
     bool attached_ = false;
+    ChannelStateMachine state_machine_;
 
     bool attach(uint16_t ch,
                 const std::string& lvds_ring_name,
@@ -76,6 +62,7 @@ public:
         }
 
         channel_id = ch;
+        state_machine_.initialize(ch);
 
         lvds_ring = rte_ring_lookup(lvds_ring_name.c_str());
         control_result_ring = rte_ring_lookup(result_ring_name.c_str());
@@ -91,33 +78,31 @@ public:
         return true;
     }
 
-    bool dequeue_lvds(std::vector<uint8_t>& out,
-                      std::chrono::milliseconds timeout) {
-        if (!attached_ || !lvds_ring) {
-            return false;
-        }
+    bool dequeue_lvds(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
+        if (!attached_ || !lvds_ring) return false;
+        if (!dequeue_packet(lvds_ring, out, timeout)) return false;
 
-        return dequeue_packet(lvds_ring, out, timeout);
+        // state machine hook: parse sequence and update state
+        // real implementation should decode IndustrialHeader and call state_machine_.on_lvds_frame(...)
+        // here we keep the worker pattern simple and safe.
+        return true;
     }
 
-    bool dequeue_control_result(std::vector<uint8_t>& out,
-                                std::chrono::milliseconds timeout) {
-        if (!attached_ || !control_result_ring) {
-            return false;
-        }
+    bool dequeue_control_result(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
+        if (!attached_ || !control_result_ring) return false;
+        if (!dequeue_packet(control_result_ring, out, timeout)) return false;
 
-        return dequeue_packet(control_result_ring, out, timeout);
+        // state machine hook: parse command_id and ACK/NACK and call state_machine_.on_control_result(...)
+        // real implementation should decode IndustrialHeader and payload accordingly.
+        return true;
     }
 
-    bool enqueue_control_tx(const void* payload,
-                            std::size_t payload_len,
-                            uint32_t command_id) {
-        if (!attached_ ||
-            control_tx_ring == nullptr ||
-            payload == nullptr ||
-            payload_len == 0) {
+    bool enqueue_control_tx(const void* payload, std::size_t payload_len, uint32_t command_id) {
+        if (!attached_ || control_tx_ring == nullptr || payload == nullptr || payload_len == 0) {
             return false;
         }
+
+        state_machine_.enqueue_control_command(command_id, 0, payload, static_cast<uint16_t>(payload_len));
 
         rte_mempool* pool = rte_mempool_lookup(kMbufPoolName);
         if (pool == nullptr) {
@@ -145,7 +130,6 @@ public:
         }
 
         std::memcpy(dst, payload, payload_len);
-
         if (rte_ring_enqueue(control_tx_ring, mbuf) != 0) {
             std::cerr << "control tx ring is full, command_id=" << command_id << '\n';
             rte_pktmbuf_free(mbuf);
@@ -155,14 +139,8 @@ public:
         return true;
     }
 
-    uint16_t get_channel_id() const noexcept {
-        return channel_id;
-    }
-
-    bool attached() const noexcept {
-        return attached_;
-    }
-
+    uint16_t get_channel_id() const noexcept { return channel_id; }
+    bool attached() const noexcept { return attached_; }
     void detach() noexcept {
         lvds_ring = nullptr;
         control_result_ring = nullptr;
@@ -171,14 +149,9 @@ public:
     }
 };
 
-ChannelWorker::ChannelWorker()
-    : impl_(std::make_unique<ChannelWorker::Impl>()) {}
-
+ChannelWorker::ChannelWorker() : impl_(std::make_unique<ChannelWorker::Impl>()) {}
 ChannelWorker::~ChannelWorker() = default;
-
-ChannelWorker::ChannelWorker(ChannelWorker&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-
+ChannelWorker::ChannelWorker(ChannelWorker&& other) noexcept : impl_(std::move(other.impl_)) {}
 ChannelWorker& ChannelWorker::operator=(ChannelWorker&& other) noexcept {
     if (this != &other) {
         impl_ = std::move(other.impl_);
@@ -186,65 +159,31 @@ ChannelWorker& ChannelWorker::operator=(ChannelWorker&& other) noexcept {
     return *this;
 }
 
-bool ChannelWorker::attach(
-    uint16_t channel_id,
-    const std::string& ring_name_lvds,
-    const std::string& ring_name_control_result,
-    const std::string& ring_name_control_tx) {
-    if (!impl_) {
-        impl_ = std::make_unique<ChannelWorker::Impl>();
-    }
-
-    return impl_->attach(
-        channel_id,
-        ring_name_lvds,
-        ring_name_control_result,
-        ring_name_control_tx);
+bool ChannelWorker::attach(uint16_t channel_id,
+                          const std::string& ring_name_lvds,
+                          const std::string& ring_name_control_result,
+                          const std::string& ring_name_control_tx) {
+    if (!impl_) impl_ = std::make_unique<ChannelWorker::Impl>();
+    return impl_->attach(channel_id, ring_name_lvds, ring_name_control_result, ring_name_control_tx);
 }
 
-bool ChannelWorker::dequeue_lvds(
-    std::vector<uint8_t>& out,
-    std::chrono::milliseconds timeout) {
-    if (!impl_) {
-        return false;
-    }
-
+bool ChannelWorker::dequeue_lvds(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
+    if (!impl_) return false;
     return impl_->dequeue_lvds(out, timeout);
 }
 
-bool ChannelWorker::dequeue_control_result(
-    std::vector<uint8_t>& out,
-    std::chrono::milliseconds timeout) {
-    if (!impl_) {
-        return false;
-    }
-
+bool ChannelWorker::dequeue_control_result(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
+    if (!impl_) return false;
     return impl_->dequeue_control_result(out, timeout);
 }
 
-bool ChannelWorker::enqueue_control_tx(
-    const void* payload,
-    std::size_t payload_len,
-    uint32_t command_id) {
-    if (!impl_) {
-        return false;
-    }
-
+bool ChannelWorker::enqueue_control_tx(const void* payload, std::size_t payload_len, uint32_t command_id) {
+    if (!impl_) return false;
     return impl_->enqueue_control_tx(payload, payload_len, command_id);
 }
 
-uint16_t ChannelWorker::channel_id() const noexcept {
-    return impl_ ? impl_->get_channel_id() : 0;
-}
-
-bool ChannelWorker::attached() const noexcept {
-    return impl_ ? impl_->attached() : false;
-}
-
-void ChannelWorker::detach() noexcept {
-    if (impl_) {
-        impl_->detach();
-    }
-}
+uint16_t ChannelWorker::channel_id() const noexcept { return impl_ ? impl_->get_channel_id() : 0; }
+bool ChannelWorker::attached() const noexcept { return impl_ ? impl_->attached() : false; }
+void ChannelWorker::detach() noexcept { if (impl_) impl_->detach(); }
 
 } // namespace industrial
