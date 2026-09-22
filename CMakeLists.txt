@@ -171,6 +171,7 @@ add_library(industrial_rx SHARED
     src/primary.cpp
     src/worker.cpp
     src/tx.cpp
+    src/channel_state_machine.cpp
 )
 
 target_include_directories(industrial_rx
